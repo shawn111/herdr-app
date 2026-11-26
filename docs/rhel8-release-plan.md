@@ -108,12 +108,13 @@ Commit `9a3c18f` on branch `build/rhel8-release-gha`.
 git add .github/workflows/release.yml
 git commit -m "ci: build RHEL 8 release on x86_64 only"
 git push -u origin build/rhel8-release-gha
-gh workflow run release.yml --repo shawn111/herdr-app --ref build/rhel8-release-gha
-gh run list --workflow release.yml --repo shawn111/herdr-app --limit 5
-gh run watch <run-id> --repo shawn111/herdr-app --exit-status
+REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+gh workflow run release.yml --repo "$REPO" --ref build/rhel8-release-gha
+gh run list --workflow release.yml --repo "$REPO" --limit 5
+gh run watch <run-id> --repo "$REPO" --exit-status
 ```
 
-On failure: `gh run view <run-id> --repo shawn111/herdr-app --log-failed`, fix
+On failure: `gh run view <run-id> --repo "$REPO" --log-failed`, fix
 the workflow on the same branch, commit with a lowercase conventional message,
 push, re-trigger, and repeat **until the run succeeds**. Keep the scope
 single-platform while debugging — don't restore Windows/macOS/CI/publishing to
