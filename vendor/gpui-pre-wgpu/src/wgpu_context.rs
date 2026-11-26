@@ -489,6 +489,9 @@ impl WgpuContext {
                 label: Some("gpui_device"),
                 required_features,
                 required_limits,
+                default_queue: wgpu::QueueDescriptor {
+                    label: Some("gpui_queue"),
+                },
                 memory_hints: wgpu::MemoryHints::MemoryUsage,
                 trace: wgpu::Trace::Off,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),

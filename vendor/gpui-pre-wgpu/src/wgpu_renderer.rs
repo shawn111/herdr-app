@@ -8,7 +8,7 @@ use gpui::{
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawWindowHandle};
 use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::num::NonZeroU64;
@@ -148,6 +148,20 @@ fn choose_present_mode(
     } else {
         log::warn!("wgpu: present mode {mode:?} is not supported by this surface; using Fifo");
         wgpu::PresentMode::Fifo
+    }
+}
+
+/// HERDR: `HERDR_APP_DAMAGE_TRACKING=0` restores the full-frame path when a
+/// driver or compositor handles partial presentation badly.
+fn damage_tracking_enabled() -> bool {
+    match std::env::var("HERDR_APP_DAMAGE_TRACKING").as_deref() {
+        Ok("0" | "false" | "off") => false,
+        Ok("" | "1" | "true" | "on") => true,
+        Ok(other) => {
+            warn!("HERDR_APP_DAMAGE_TRACKING: expected 0 or 1, got {other:?}; using 1");
+            true
+        }
+        Err(_) => true,
     }
 }
 
@@ -441,6 +455,9 @@ pub struct WgpuRenderer {
     needs_redraw: bool,
     // HERDR: atlas validity must outlive the consumable redraw request.
     scene_valid: bool,
+    /// Whether the surface belongs to an X11 window, so device recovery can
+    /// rebuild the same presentation path.
+    x11_window: bool,
     /// Whether frames are rendered into a damage target so only the damaged
     /// region is redrawn.
     damage_enabled: bool,
@@ -494,6 +511,12 @@ impl WgpuRenderer {
         let window_handle = window
             .window_handle()
             .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
+        // Partial presentation is only for X11 today. Wayland's compositor has
+        // its own damage protocol, so leave that window on the full-frame path.
+        let x11_window = matches!(
+            window_handle.as_raw(),
+            RawWindowHandle::Xcb(_) | RawWindowHandle::Xlib(_)
+        );
 
         let target = wgpu::SurfaceTargetUnsafe::RawHandle {
             // Fall back to the display handle already provided via InstanceDescriptor::display.
@@ -537,6 +560,7 @@ impl WgpuRenderer {
             config,
             compositor_gpu,
             atlas,
+            x11_window,
         )
     }
 
@@ -561,7 +585,7 @@ impl WgpuRenderer {
         config: WgpuSurfaceConfig,
     ) -> anyhow::Result<Self> {
         let atlas = Arc::new(WgpuAtlas::from_context(context));
-        Self::new_internal(None, context, surface, config, None, atlas)
+        Self::new_internal(None, context, surface, config, None, atlas, false)
     }
 
     fn new_internal(
@@ -571,6 +595,7 @@ impl WgpuRenderer {
         config: WgpuSurfaceConfig,
         compositor_gpu: Option<CompositorGpuHint>,
         atlas: Arc<WgpuAtlas>,
+        x11_window: bool,
     ) -> anyhow::Result<Self> {
         let surface_caps = surface.get_capabilities(&context.adapter);
         let preferred_formats = [
@@ -581,7 +606,13 @@ impl WgpuRenderer {
             .iter()
             .find(|f| surface_caps.formats.contains(f))
             .copied()
-            .or_else(|| surface_caps.formats.iter().find(|f| !f.is_srgb()).copied())
+            .or_else(|| {
+                surface_caps
+                    .formats
+                    .iter()
+                    .find(|f| !f.has_srgb_suffix())
+                    .copied()
+            })
             .or_else(|| surface_caps.formats.first().copied())
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -648,9 +679,11 @@ impl WgpuRenderer {
 
         // Partial presentation copies a persistent target into the swapchain,
         // which requires COPY_DST. Keep the old full-frame path when the surface
-        // cannot do that, and on machines with a real GPU where it is not
-        // needed.
+        // cannot do that, outside X11, when disabled by the kill switch, and on
+        // machines with a real GPU where it is not needed.
         let damage_supported = cfg!(not(target_family = "wasm"))
+            && x11_window
+            && damage_tracking_enabled()
             && cpu_adapter
             && surface_caps
                 .usages
@@ -678,7 +711,7 @@ impl WgpuRenderer {
         // HERDR: one line that answers "what is this machine rendering with?"
         log::info!(
             "wgpu window: adapter={:?} backend={:?} type={:?}; present={:?} latency={}; \
-             path MSAA={}; subpixel text={}",
+             path MSAA={}; subpixel text={}; damage={}",
             adapter_info.name,
             adapter_info.backend,
             adapter_info.device_type,
@@ -686,6 +719,7 @@ impl WgpuRenderer {
             frame_latency,
             core.rendering_params.path_sample_count,
             core.dual_source_blending,
+            damage_supported,
         );
 
         Ok(Self {
@@ -693,7 +727,7 @@ impl WgpuRenderer {
             compositor_gpu,
             state: RendererState::Ready { surface, core },
             surface_config,
-            atlas,
+            atlas: Arc::clone(&atlas),
             transparent_alpha_mode,
             opaque_alpha_mode,
             max_texture_size,
@@ -704,9 +738,10 @@ impl WgpuRenderer {
             last_surface_error: None,
             needs_redraw: false,
             scene_valid: true,
+            x11_window,
             damage_enabled: damage_supported,
             pending_damage: SceneDamage::Full,
-            last_atlas_generation: atlas.generation(),
+            last_atlas_generation: atlas.as_ref().generation(),
         })
     }
 }
@@ -1735,7 +1770,7 @@ impl WgpuRendererCore {
         self.resources
             .device
             .poll(wgpu::PollType::Wait {
-                submission_index: Some(submission),
+                submission_index: submission,
                 timeout: Some(std::time::Duration::from_secs(5)),
             })
             .map_err(|error| anyhow::anyhow!("Failed to wait for headless rendering: {error}"))?;
@@ -1746,7 +1781,10 @@ impl WgpuRendererCore {
             .map_err(|error| anyhow::anyhow!("Failed to receive headless mapping result: {error}"))?
             .map_err(|error| anyhow::anyhow!("Failed to map headless readback buffer: {error}"))?;
 
-        let mapped_data = readback_buffer.slice(..).get_mapped_range();
+        let mapped_data = readback_buffer
+            .slice(..)
+            .get_mapped_range()
+            .map_err(|error| anyhow::anyhow!("Failed to map headless readback buffer: {error}"))?;
         let pixel_capacity = usize::try_from(u64::from(bytes_per_row) * u64::from(height))
             .map_err(|_| anyhow::anyhow!("Headless image size exceeds addressable memory"))?;
         let mut pixels = Vec::with_capacity(pixel_capacity);
@@ -1929,6 +1967,7 @@ impl WgpuRendererCore {
             dual_source_blending,
             adapter_info: context.adapter.get_info(),
             target_format,
+            damage_target: None,
             max_texture_size,
         }
     }
@@ -2019,7 +2058,7 @@ impl WgpuRendererCore {
         premultiplied_alpha: bool,
         clear_color: wgpu::Color,
         scissor: Option<wgpu::Rect<u32>>,
-    ) -> Result<wgpu::SubmissionIndex> {
+    ) -> Result<Option<wgpu::SubmissionIndex>> {
         anyhow::ensure!(
             size.width.0 > 0 && size.height.0 > 0,
             "invalid render target size: {size:?}"
@@ -2079,7 +2118,7 @@ impl WgpuRendererCore {
         frame_view: &wgpu::TextureView,
         clear_color: wgpu::Color,
         scissor: Option<wgpu::Rect<u32>>,
-    ) -> Result<wgpu::SubmissionIndex> {
+    ) -> Result<Option<wgpu::SubmissionIndex>> {
         let mut instance_offset = 0;
         let instance_bindings = self
             .write_instances(scene, &mut instance_offset)
@@ -2889,6 +2928,7 @@ impl WgpuRenderer {
             config,
             self.compositor_gpu,
             self.atlas.clone(),
+            self.x11_window,
         )?;
         self.set_subpixel_layout(is_bgr);
         self.invalidate_scene();

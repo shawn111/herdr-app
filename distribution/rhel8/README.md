@@ -46,6 +46,7 @@ you can A/B one at a time:
 | `HERDR_APP_PRESENT_MODE=fifo\|mailbox\|immediate` | force a present mode (`fifo` restores vsync) |
 | `HERDR_APP_FRAME_LATENCY=1..4` | frames the driver may queue; default is 1 with `Immediate`, else 2 |
 | `HERDR_APP_PATH_MSAA=1\|2\|4` | path antialiasing; default is 1 on a CPU adapter |
+| `HERDR_APP_DAMAGE_TRACKING=0` | disable partial presentation and redraw the whole window |
 | `GPUI_WGPU_BACKEND=vulkan\|gl` | use only one wGPU backend; comma-separate to allow both |
 | `GPUI_WGPU_FRAME_LOG=1` | log frames/s and acquire/render/present milliseconds once a second |
 | `HERDR_APP_LOG=info` | show the adapter, backend, present mode, MSAA and X11 refresh rate at startup |

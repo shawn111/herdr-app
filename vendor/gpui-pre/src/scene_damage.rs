@@ -1,7 +1,7 @@
 //! Diffs consecutive scenes to find the region of the window that changed, so a
 //! renderer can redraw and present only that region.
 
-use crate::{Bounds, PaintOperation, Primitive, ScaledPixels, Scene};
+use crate::{Bounds, PaintOperation, ScaledPixels, Scene};
 use std::ops::Range;
 
 /// How far ahead the diff looks for a matching operation after a mismatch, so
