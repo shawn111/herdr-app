@@ -80,6 +80,50 @@ struct DamageTarget {
     view: wgpu::TextureView,
 }
 
+/// How a window uses the damage rect computed by the scene diff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DamageMode {
+    /// Redraw and present the whole window.
+    Disabled,
+    /// Redraw the whole window, but tell the compositor which part changed.
+    ///
+    /// GLES surfaces expose only `RENDER_ATTACHMENT`, so they cannot be the
+    /// destination of the persistent-target copy. They can still receive a
+    /// damage rect at present time.
+    PresentDamage,
+    /// Redraw only the damaged region into a persistent target, copy the whole
+    /// target into the swapchain, then present with the damage rect.
+    CopyToSwapchain,
+}
+
+impl DamageMode {
+    fn enabled(self) -> bool {
+        self != Self::Disabled
+    }
+}
+
+/// Choose the damage path. Keep this a pure function so the backend-specific
+/// rules can be tested without a surface.
+fn choose_damage_mode(
+    backend: wgpu::Backend,
+    x11_window: bool,
+    tracking_enabled: bool,
+    cpu_adapter: bool,
+    surface_supports_copy_dst: bool,
+) -> DamageMode {
+    if !x11_window || !tracking_enabled || !cpu_adapter {
+        return DamageMode::Disabled;
+    }
+    if backend == wgpu::Backend::Gl {
+        return DamageMode::PresentDamage;
+    }
+    if surface_supports_copy_dst {
+        DamageMode::CopyToSwapchain
+    } else {
+        DamageMode::Disabled
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrawOutcome {
     Presented,
@@ -474,9 +518,8 @@ pub struct WgpuRenderer {
     /// Whether the surface belongs to an X11 window, so device recovery can
     /// rebuild the same presentation path.
     x11_window: bool,
-    /// Whether frames are rendered into a damage target so only the damaged
-    /// region is redrawn.
-    damage_enabled: bool,
+    /// How the scene-damage rect is used by this window.
+    damage_mode: DamageMode,
     /// Damage accumulated since the last present.
     pending_damage: SceneDamage,
     /// Atlas generation used by the last presented frame.
@@ -693,19 +736,24 @@ impl WgpuRenderer {
         );
         let frame_latency = frame_latency(present_mode);
 
-        // Partial presentation copies a persistent target into the swapchain,
-        // which requires COPY_DST. Keep the old full-frame path when the surface
-        // cannot do that, outside X11, when disabled by the kill switch, and on
-        // machines with a real GPU where it is not needed.
-        let damage_supported = cfg!(not(target_family = "wasm"))
-            && x11_window
-            && damage_tracking_enabled()
-            && cpu_adapter
-            && surface_caps
-                .usages
-                .contains(wgpu::TextureUsages::COPY_DST);
+        // HERDR: damage is only for X11 CPU adapters, and the kill switch still
+        // restores the old full-frame path. GLES cannot copy a persistent target
+        // into its surface, but it can pass the damage rect to the compositor;
+        // other backends keep the existing copy-to-swapchain path.
+        let copy_damage_supported = surface_caps.usages.contains(wgpu::TextureUsages::COPY_DST);
+        let damage_mode = if cfg!(not(target_family = "wasm")) {
+            choose_damage_mode(
+                adapter_info.backend,
+                x11_window,
+                damage_tracking_enabled(),
+                cpu_adapter,
+                copy_damage_supported,
+            )
+        } else {
+            DamageMode::Disabled
+        };
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: if damage_supported {
+            usage: if damage_mode == DamageMode::CopyToSwapchain {
                 wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST
             } else {
                 wgpu::TextureUsages::RENDER_ATTACHMENT
@@ -727,7 +775,7 @@ impl WgpuRenderer {
         // HERDR: one line that answers "what is this machine rendering with?"
         log::info!(
             "wgpu window: adapter={:?} backend={:?} type={:?}; present={:?} latency={}; \
-             path MSAA={}; subpixel text={}; damage={}",
+             path MSAA={}; subpixel text={}; damage={}; damage mode={:?}",
             adapter_info.name,
             adapter_info.backend,
             adapter_info.device_type,
@@ -735,7 +783,8 @@ impl WgpuRenderer {
             frame_latency,
             core.rendering_params.path_sample_count,
             core.dual_source_blending,
-            damage_supported,
+            damage_mode.enabled(),
+            damage_mode,
         );
 
         Ok(Self {
@@ -755,7 +804,7 @@ impl WgpuRenderer {
             needs_redraw: false,
             scene_valid: true,
             x11_window,
-            damage_enabled: damage_supported,
+            damage_mode,
             pending_damage: SceneDamage::Full,
             last_atlas_generation: atlas.as_ref().generation(),
         })
@@ -1511,7 +1560,7 @@ impl WgpuRenderer {
 
     /// Whether this renderer uses the damage passed to [`Self::draw_with_damage`].
     pub fn damage_enabled(&self) -> bool {
-        self.damage_enabled
+        self.damage_mode.enabled()
     }
 
     pub fn draw(&mut self, scene: &Scene) -> bool {
@@ -1613,10 +1662,13 @@ impl WgpuRenderer {
         let width = size.width.0 as u32;
         let height = size.height.0 as u32;
 
-        let scissor = if self.damage_enabled {
-            if core.ensure_damage_target(size, frame.texture.format()) {
-                self.pending_damage = SceneDamage::Full;
-            }
+        let copy_damage = self.damage_mode == DamageMode::CopyToSwapchain;
+        if copy_damage && core.ensure_damage_target(size, frame.texture.format()) {
+            self.pending_damage = SceneDamage::Full;
+        }
+        // Every enabled mode computes a damage rect. `PresentDamage` only uses it
+        // at present time; `CopyToSwapchain` also uses it to scissor rendering.
+        let damage_rect = if self.damage_mode.enabled() {
             match self.pending_damage {
                 SceneDamage::Rect(damage) => damage_scissor(damage, width, height),
                 SceneDamage::Full | SceneDamage::Unchanged => None,
@@ -1624,26 +1676,25 @@ impl WgpuRenderer {
         } else {
             None
         };
-        let partial_frame = scissor.is_some();
-        let damage_bp = scissor.map_or(10_000, |scissor| {
+        let damage_bp = damage_rect.map_or(10_000, |damage_rect| {
             let total = u64::from(width).saturating_mul(u64::from(height));
             if total == 0 {
                 10_000
             } else {
-                u64::from(scissor.w)
-                    .saturating_mul(u64::from(scissor.h))
+                u64::from(damage_rect.w)
+                    .saturating_mul(u64::from(damage_rect.h))
                     .saturating_mul(10_000)
                     .div_euclid(total)
                     .min(10_000)
             }
         });
-        if scissor.is_some_and(|scissor| scissor.w == 0 || scissor.h == 0) {
+        if damage_rect.is_some_and(|rect| rect.w == 0 || rect.h == 0) {
             // The damage lies outside the window.
             self.pending_damage = SceneDamage::Unchanged;
             return DrawOutcome::Unchanged;
         }
 
-        let (target_texture, target_view) = if self.damage_enabled {
+        let (target_texture, target_view) = if copy_damage {
             let Some(target) = core.damage_target.as_ref() else {
                 return DrawOutcome::Failed;
             };
@@ -1666,7 +1717,7 @@ impl WgpuRenderer {
             size,
             premultiplied_alpha,
             wgpu::Color::TRANSPARENT,
-            scissor,
+            if copy_damage { damage_rect } else { None },
         ) {
             log::error!("{error:#}");
             return DrawOutcome::Failed;
@@ -1701,10 +1752,10 @@ impl WgpuRenderer {
 
         self.scene_valid = true;
         let present_start = timing.map(|_| Instant::now());
-        if let Some(scissor) = scissor {
+        if let Some(damage_rect) = damage_rect {
             core.resources
                 .queue
-                .present_with_damage(frame, &[scissor]);
+                .present_with_damage(frame, &[damage_rect]);
         } else {
             core.resources.queue.present(frame);
         }
@@ -1713,7 +1764,7 @@ impl WgpuRenderer {
                 acquire,
                 render,
                 present: present_start.elapsed(),
-                partial: partial_frame,
+                partial: damage_rect.is_some(),
                 damage_bp,
             });
         }
@@ -2865,6 +2916,9 @@ impl WgpuRenderer {
         };
         surface.configure(&core.resources.device, &self.surface_config);
         core.resources.invalidate_intermediate_textures();
+        // A new surface has no preserved pixels, so damage tracking must start
+        // from a full frame even if the previous surface was unchanged.
+        self.pending_damage = SceneDamage::Full;
         self.state = RendererState::Ready { surface, core };
 
         Ok(())
@@ -3546,6 +3600,42 @@ mod tests {
                 32.0_f32.to_bits(),
                 33.0_f32.to_bits(),
             ]
+        );
+    }
+
+    #[test]
+    fn gl_cpu_x11_uses_present_damage_without_copy_dst() {
+        assert_eq!(
+            choose_damage_mode(wgpu::Backend::Gl, true, true, true, false),
+            DamageMode::PresentDamage
+        );
+    }
+
+    #[test]
+    fn non_gl_cpu_x11_still_needs_copy_dst_for_damage() {
+        assert_eq!(
+            choose_damage_mode(wgpu::Backend::Vulkan, true, true, true, true),
+            DamageMode::CopyToSwapchain
+        );
+        assert_eq!(
+            choose_damage_mode(wgpu::Backend::Vulkan, true, true, true, false),
+            DamageMode::Disabled
+        );
+    }
+
+    #[test]
+    fn damage_stays_disabled_outside_the_experiment() {
+        assert_eq!(
+            choose_damage_mode(wgpu::Backend::Gl, false, true, true, true),
+            DamageMode::Disabled
+        );
+        assert_eq!(
+            choose_damage_mode(wgpu::Backend::Gl, true, false, true, true),
+            DamageMode::Disabled
+        );
+        assert_eq!(
+            choose_damage_mode(wgpu::Backend::Gl, true, true, false, true),
+            DamageMode::Disabled
         );
     }
 }

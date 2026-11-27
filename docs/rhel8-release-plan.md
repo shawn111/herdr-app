@@ -133,11 +133,12 @@ selected from the environment, so a GPU machine keeps its old behavior.
 | Change | Default | Override |
 |---|---|---|
 | Present mode | `Immediate` on a software adapter (`DeviceType::Cpu`); otherwise the surface's preference, else `Fifo` | `HERDR_APP_PRESENT_MODE=fifo\|mailbox\|immediate` |
-| Frame latency | `1` with `Immediate`, else `2` | `HERDR_APP_FRAME_LATENCY=1..4` |
+| Frame latency | `1` with `Immediate`, else `2`; wGPU ignores it on OpenGL | `HERDR_APP_FRAME_LATENCY=1..4` |
 | Path MSAA | `1` on a software adapter (the path pass writes a full-window intermediate texture); otherwise 4x/2x/1x as before | `HERDR_APP_PATH_MSAA=1\|2\|4` |
+| Damage | swap rects on GL X11 CPU windows; scissored redraw where the surface supports `COPY_DST` | `HERDR_APP_DAMAGE_TRACKING=0` |
 | wGPU backends | Vulkan + GL | `GPUI_WGPU_BACKEND=vulkan\|gl` (comma-separated) |
-| Frame timings | off | `GPUI_WGPU_FRAME_LOG=1` logs frames/s and acquire/render/present ms once a second |
-| Startup line | always at info | `HERDR_APP_LOG=info` shows adapter/backend/type, present mode, latency, path MSAA, subpixel text |
+| Frame timings | off | `GPUI_WGPU_FRAME_LOG=1` logs frames/s, acquire/render/present ms, damage rects and area once a second |
+| Startup line | always at info | `HERDR_APP_LOG=info` shows adapter/backend/type, present mode, latency, path MSAA, subpixel text and damage mode |
 
 Headless renderers and screenshot tests do not get the CPU tuning
 (`tune_for_cpu = false`), so `shot_pixels` stays pixel-identical. `Immediate`

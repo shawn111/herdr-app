@@ -26,12 +26,18 @@ change the shipped no-GPU tuning until a benchmark shows a real improvement.
 ## What the branch does
 
 - Diffs consecutive GPUI scenes into `SceneDamage::{Full, Rect, Unchanged}`.
-- Enables the partial path only for X11 windows with a CPU adapter and a surface
-  that supports `COPY_DST`. Hardware, Wayland, WASM, headless rendering,
-  `render_to_image`, and non-unit scale factors stay on the full-frame path.
-- Renders damaged regions with a scissor into a persistent target, copies the
-  complete target into the swapchain, and passes the damage rect to
-  `present_with_damage`. The full copy is still required; see
+- Enables damage only for X11 windows with a CPU adapter. Hardware, Wayland,
+  WASM, headless rendering, `render_to_image`, and non-unit scale factors stay
+  on the full-frame path.
+- On GL, damage is **swap-only** first: the window is still redrawn in full, and
+  the damage rect is passed to `present_with_damage`. The tested Mesa llvmpipe
+  22.3 reports `-swap_buffers_with_damage`, so wGPU falls back to a full swap
+  there; other EGL drivers can skip unchanged pixels. Scissored GL rendering is
+  a later step.
+- On backends whose surface supports `COPY_DST`, keeps the original path: render
+  damaged regions with a scissor into a persistent target, copy the complete
+  target into the swapchain, and pass the damage rect to `present_with_damage`.
+  The full copy is still required; see
   [gfx-rs/wgpu#11038](https://github.com/gfx-rs/wgpu/issues/11038).
 - Provides `HERDR_APP_DAMAGE_TRACKING=0` to restore the full-frame path.
 - Forces full damage on resize, transparency/subpixel changes, surface
@@ -46,20 +52,22 @@ change the shipped no-GPU tuning until a benchmark shows a real improvement.
 - Third-party notices: regenerated with `cargo-about` 0.9.3 and Bun.
 - CI: Linux, macOS, and Windows all pass; RHEL 8 release build succeeds.
 - A first release build still feels slow; no performance improvement has been
-  proven. `GPUI_WGPU_FRAME_LOG=1` now also logs `partial=n/frames` and the
-  average damaged area, so an A/B run can show whether the partial path is
-  active and how much of the window it redraws.
+  proven. The target machine uses GL/llvmpipe with `-swap_buffers_with_damage`,
+  so the earlier release build never entered a damage path at all.
+- `GPUI_WGPU_FRAME_LOG=1` now logs `partial=n/frames` and the average damaged
+  area. The startup line names the damage mode (`PresentDamage` on GL,
+  `CopyToSwapchain` on other supported backends).
 
 ## Next checks
 
-1. Push the CI fixes and get all platform jobs green.
-2. Use `GPUI_WGPU_FRAME_LOG=1` and `HERDR_APP_DAMAGE_TRACKING=0` to A/B the
-   full-frame and partial paths in the X11 sandbox and on the target RHEL 8
-   machine.
-3. Verify whether X11 with llvmpipe/lavapipe actually consumes damage rects;
-   backends without incremental presentation ignore them.
-4. Keep hardware, macOS, Windows, Wayland, headless rendering, and
+1. A/B `HERDR_APP_DAMAGE_TRACKING=0` against the default on the target RHEL 8
+   machine. On GL this isolates swap-with-damage; llvmpipe is expected to ignore
+   it, so a difference there would point at the compositor.
+2. If swap damage alone does not help, add scissored GL rendering: wGPU's GLES
+   surface texture is one persistent renderbuffer, so only the damage rect needs
+   to be redrawn.
+3. Keep hardware, macOS, Windows, Wayland, headless rendering, and
    `render_to_image` on the existing path unless a separate experiment proves
    otherwise.
-5. Discuss any app-core or herdr-core API changes with Can before landing them;
+4. Discuss any app-core or herdr-core API changes with Can before landing them;
    otherwise keep the experiment in vendored GPUI and mods.
