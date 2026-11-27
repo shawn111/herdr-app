@@ -16,7 +16,8 @@ use crate::{
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
     RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
+    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, SceneDamage, Shadow,
+    SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
     TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
@@ -731,6 +732,7 @@ type FrameCallback = Box<dyn FnOnce(&mut Window, &mut App)>;
 
 pub(crate) type AnyMouseListener =
     Box<dyn FnMut(&dyn Any, DispatchPhase, &mut Window, &mut App) + 'static>;
+type AnyMouseObserver = Box<dyn FnMut(&dyn Any, &mut Window, &mut App) + 'static>;
 
 #[derive(Clone)]
 pub(crate) struct CursorStyleRequest {
@@ -990,6 +992,7 @@ pub(crate) struct Frame {
     pub(crate) element_states: FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
     accessed_element_states: Vec<(GlobalElementId, TypeId)>,
     pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
+    mouse_observers: Vec<Option<AnyMouseObserver>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
     pub(crate) hitboxes: Vec<Hitbox>,
@@ -1025,6 +1028,7 @@ pub(crate) struct PaintIndex {
     #[cfg(any(test, feature = "test-support"))]
     debug_bounds_index: usize,
     mouse_listeners_index: usize,
+    mouse_observers_index: usize,
     input_handlers_index: usize,
     cursor_styles_index: usize,
     accessed_element_states_index: usize,
@@ -1046,6 +1050,7 @@ impl Frame {
             element_states: FxHashMap::default(),
             accessed_element_states: Vec::new(),
             mouse_listeners: Vec::new(),
+            mouse_observers: Vec::new(),
             dispatch_tree,
             scene: Scene::default(),
             hitboxes: Vec::new(),
@@ -1073,6 +1078,7 @@ impl Frame {
         self.element_states.clear();
         self.accessed_element_states.clear();
         self.mouse_listeners.clear();
+        self.mouse_observers.clear();
         self.dispatch_tree.clear();
         self.scene.clear();
         self.input_handlers.clear();
@@ -1204,6 +1210,8 @@ pub struct Window {
     // HERDR: distinguish an empty scene from a window that has not drawn yet.
     rendered_frame_size: Option<(Size<Pixels>, f32)>,
     pub(crate) next_frame: Frame,
+    /// Damage from draws since the last present.
+    render_damage: Option<SceneDamage>,
     next_hitbox_id: HitboxId,
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
@@ -1212,6 +1220,8 @@ pub struct Window {
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     focus_lost_path: SmallVec<[FocusId; 8]>,
+    focus_lost_yielded: bool,
+    yielded_focus: Option<FocusId>,
     default_prevented: bool,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
@@ -2100,6 +2110,7 @@ impl Window {
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             rendered_frame_size: None,
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
+            render_damage: None,
             next_frame_callbacks,
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
@@ -2108,6 +2119,8 @@ impl Window {
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
             focus_lost_path: SmallVec::new(),
+            focus_lost_yielded: false,
+            yielded_focus: None,
             default_prevented: true,
             mouse_position,
             mouse_hit_test: HitTest::default(),
@@ -2353,6 +2366,12 @@ impl Window {
         })
     }
 
+    /// Whether the focus-lost notification came from an explicit keyboard handoff.
+    /// Available while focus-lost listeners are running.
+    pub fn focus_was_yielded(&self) -> bool {
+        self.focus_lost_yielded
+    }
+
     /// Move focus to the element associated with the given [`FocusHandle`].
     pub fn focus(&mut self, handle: &FocusHandle, cx: &mut App) {
         if !self.focus_enabled || self.focus == Some(handle.id) {
@@ -2360,6 +2379,7 @@ impl Window {
         }
 
         self.focus = Some(handle.id);
+        self.yielded_focus = None;
         self.focus_generation = self.focus_generation.wrapping_add(1);
         self.clear_pending_keystrokes(cx);
 
@@ -2379,6 +2399,15 @@ impl Window {
         }
         self.focus = None;
         self.refresh();
+    }
+
+    /// Clear focus and tell focus-lost listeners that the control gave up the keyboard.
+    pub fn yield_focus(&mut self, cx: &mut App) {
+        let focused = self.focus;
+        self.blur(cx);
+        if self.focus.is_none() && focused.is_some() {
+            self.yielded_focus = focused;
+        }
     }
 
     /// Blur the window and don't allow anything in it to be focused again.
@@ -3407,6 +3436,13 @@ impl Window {
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
+        if self.platform_window.wants_render_damage() {
+            let damage = SceneDamage::between(&self.rendered_frame.scene, &self.next_frame.scene);
+            self.render_damage = Some(
+                self.render_damage
+                    .map_or(damage, |pending| pending.union(damage)),
+            );
+        }
         // Cached paint ranges can reuse image sprites without calling paint_image.
         let current_image_tiles: FxHashSet<_> = self.next_frame.scene.polychrome_sprites.iter()
             .map(|sprite| (sprite.tile.texture_id, sprite.tile.tile_id.0)).collect();
@@ -3460,16 +3496,19 @@ impl Window {
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
         let mut focus_before_listeners = self.focus;
+        let yielded_focus = self.yielded_focus.take();
 
         if previous_focus_path != current_focus_path
             || previous_window_active != current_window_active
         {
             if !previous_focus_path.is_empty() && current_focus_path.is_empty() {
+                self.focus_lost_yielded = yielded_focus.as_ref() == previous_focus_path.last();
                 self.focus_lost_path = previous_focus_path.clone();
                 self.focus_lost_listeners
                     .clone()
                     .retain(&(), |listener| listener(self, cx));
                 self.focus_lost_path = SmallVec::new();
+                self.focus_lost_yielded = false;
                 // The focus-lost fallback (e.g. a workspace refocusing itself) may target
                 // an element that isn't part of the element tree, in which case scheduling
                 // a redraw below would dispatch focus-lost again, looping forever. Only
@@ -3549,7 +3588,12 @@ impl Window {
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
-        self.platform_window.draw(&self.rendered_frame.scene);
+        let damage = self
+            .platform_window
+            .wants_render_damage()
+            .then(|| self.render_damage.take().unwrap_or(SceneDamage::Unchanged));
+        self.platform_window
+            .draw_with_damage(&self.rendered_frame.scene, damage);
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
             present_start,
@@ -3979,6 +4023,7 @@ impl Window {
             #[cfg(any(test, feature = "test-support"))]
             debug_bounds_index: self.next_frame.debug_bounds_records.len(),
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
+            mouse_observers_index: self.next_frame.mouse_observers.len(),
             input_handlers_index: self.next_frame.input_handlers.len(),
             cursor_styles_index: self.next_frame.cursor_styles.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
@@ -4013,6 +4058,12 @@ impl Window {
                 [range.start.mouse_listeners_index..range.end.mouse_listeners_index]
                 .iter_mut()
                 .map(|listener| listener.take()),
+        );
+        self.next_frame.mouse_observers.extend(
+            self.rendered_frame.mouse_observers
+                [range.start.mouse_observers_index..range.end.mouse_observers_index]
+                .iter_mut()
+                .map(|observer| observer.take()),
         );
         self.next_frame.accessed_element_states.extend(
             self.rendered_frame.accessed_element_states[range.start.accessed_element_states_index
@@ -5435,6 +5486,23 @@ impl Window {
         )));
     }
 
+    /// Observe matching mouse events after capture and before bubbling, even when
+    /// capture stops propagation. Observers cannot change event propagation.
+    /// Register during paint. The observer is cleared when the element is no longer painted.
+    pub fn observe_mouse_event<Event: MouseEvent>(
+        &mut self,
+        mut observer: impl FnMut(&Event, &mut Window, &mut App) + 'static,
+    ) {
+        self.invalidator.debug_assert_paint();
+        self.next_frame.mouse_observers.push(Some(Box::new(
+            move |event: &dyn Any, window, cx| {
+                if let Some(event) = event.downcast_ref() {
+                    observer(event, window, cx);
+                }
+            },
+        )));
+    }
+
     /// Register a key event listener on this node for the next frame. The type of event
     /// is determined by the first parameter of the given listener. When the next frame is rendered
     /// the listener will be cleared.
@@ -5945,6 +6013,14 @@ impl Window {
                 break;
             }
         }
+
+        let mut mouse_observers = mem::take(&mut self.rendered_frame.mouse_observers);
+        let propagate_event = cx.propagate_event;
+        for observer in &mut mouse_observers {
+            observer.as_mut().unwrap()(event, self, cx);
+            cx.propagate_event = propagate_event;
+        }
+        self.rendered_frame.mouse_observers = mouse_observers;
 
         // Bubble phase, where most normal handlers do their work.
         if cx.propagate_event {

@@ -1,0 +1,184 @@
+# Plan: RHEL 8-only release build in `release.yml`
+
+Status: the app+core RHEL 8 build is **green** (run 9). Run 9 adds CPU
+rendering tuning for issue #1 (present mode, path MSAA, backend override,
+frame logging).
+
+## Goal
+
+Replace the existing `.github/workflows/release.yml` with a **single-job
+release build** for **Linux x86_64 on RHEL 8**: build both `herdr-app` and
+`herdr-core` with `cargo build --release`, pack them into one tarball, verify,
+and upload it as a GitHub Actions artifact. The core is required: without it a
+user cannot run the whole Herdr environment, even though the app itself starts.
+Trigger with `gh`, watch the run, fix failures, and repeat until it succeeds.
+
+Explicitly out of scope: full CI/tests, Windows, macOS, aarch64, signing, DMG,
+and publishing to the release bucket. `ci.yml` stays untouched.
+
+## Why the current `release.yml` is being replaced
+
+- Its Linux target builds on `ubuntu-22.04` (glibc 2.35) and says in a comment
+  that this sets the distro floor. RHEL 8 has glibc 2.28, so that binary will
+  not start there.
+- It also builds `linux-aarch64`, `macos-aarch64`, and `windows-x86_64`, plus
+  signing/DMG/publish jobs for those platforms. None of that is wanted here.
+- The pinned AlmaLinux 8 image has glibc 2.28; the Ubuntu package name
+  `libxkbcommon-x11-devel` does **not** exist there (use
+  `libxkbcommon-devel` + `libxkbcommon-x11`).
+- The app's own installer normally downloads herdr-core separately
+  (`distribution/install.sh`); an offline artifact for a user to run the whole
+  environment must therefore carry a core binary too.
+
+## Decisions
+
+| Question | Decision |
+|---|---|
+| Which file | **Replace `.github/workflows/release.yml` in place.** No new workflow file. |
+| Platform | One job only, Linux x86_64. No matrix, no Windows/macOS/aarch64 jobs. |
+| Environment | GitHub-hosted runner + `container:` pinned to `quay.io/almalinux/almalinux:8@sha256:b068b59649ddecf7c95cea3d3f16941eaf1d8a77fcf6ce94c779abae7552e2ea` (glibc 2.28). |
+| Trigger | `workflow_dispatch` so `gh workflow run release.yml --ref <branch>` starts it directly. No tag/publish trigger. |
+| App build | `scripts/package x86_64-unknown-linux-gnu` → `dist/herdr-app-linux-x86_64.tar.gz`. |
+| Core build | Clone upstream `https://github.com/herdrdev/herdr-core` (shallow, `master`), init submodules, and build `cargo build --locked --release -p herdr-core` with the same Rust/Zig toolchains in the same container. No core fork and no pinned core tag. |
+| Core patch | `distribution/rhel8/herdr-core-rhel8.patch` is a port of master commit `a84b5af0a6f967511c92a12f1eb4f96a77d260c5` onto `v0.1.11`: systemd 239 has neither `--same-dir`/`--working-directory` nor `OOMPolicy`. Kept here instead of in a core fork for pinned-tag builds; it is not applied here because master already has the fix and the port would conflict. |
+| Output | One tarball, `dist/herdr-app-rhel8-x86_64.tar.gz`: the `scripts/package` app tree plus `herdr-core`, an `hc` symlink, the `herdr-app-rhel8` launcher and `README-rhel8.md` in `herdr-app/`. Upload as artifact `herdr-app-rhel8-x86_64`. Nothing goes to the release bucket or manifest. |
+| X11 scale | This build ships a launcher, `herdr-app-rhel8`, that defaults `GPUI_X11_SCALE_FACTOR=1` when unset (an explicit value still wins). RHEL 8 X11 desktops often report `Xft.dpi: 192` on a 1080p screen, which makes GPUI lay the window out at 2x and render more pixels than the screen. The app's own code keeps its normal scale detection. |
+| Rasterizer threads | The same launcher defaults `LP_NUM_THREADS=1` when unset (Mesa llvmpipe/lavapipe: one thread instead of one per core), so rasterization doesn't compete with the compositor and the core on a small VM. An explicit value still wins. This trades frame time for CPU headroom; it is not a speedup on machines with cores to spare. |
+| Where to work | Branch `build/rhel8-release-gha` on fork `shawn111/herdr-app`; no pushes to `upstream`. |
+| Repo docs | `defaults/AGENTS.md`, `src/SKILL.md`, and `CHANGELOG.md` unchanged: no user-facing app behavior, and changelog entries are written at release time. |
+
+## Steps
+
+### 1. Commit this plan first — done
+
+Commit `9a3c18f` on branch `build/rhel8-release-gha`.
+
+### 2. Rewrite `.github/workflows/release.yml`
+
+- `name: rhel8 release build`; `permissions: contents: read`, no
+  `environment:` (works from a fork branch without release secrets).
+- `on: workflow_dispatch`; concurrency group `rhel8-release-${{ github.ref }}`,
+  `cancel-in-progress: true`; 60-minute timeout.
+- `container:` pinned digest above; `defaults.run.shell: bash`.
+- **Bootstrap before checkout** (minimal image; `actions/checkout` needs git):
+  refresh `/etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux` from the official HTTPS URL
+  and `rpm --import` it (the pinned image only has an old key), then `dnf
+  install -y ca-certificates curl tar gzip git python3 binutils` with one
+  bounded retry. Never use `nogpgcheck`.
+- Checkout with `submodules: true`, `persist-credentials: false`, pinned to the
+  same SHA used in `ci.yml`; mark `$GITHUB_WORKSPACE` as a git safe directory
+  (container root vs runner-owned workspace).
+- Toolchain: Rust `1.95.0` and Zig `0.16.0`, same versions and pinned action
+  SHAs as in `ci.yml`. Every `uses:` stays pinned to a commit SHA.
+- Build deps via `dnf`: `gcc gcc-c++ pkgconf-pkg-config clang clang-devel
+  libxcb-devel libxkbcommon-devel libxkbcommon-x11 wayland-devel vulkan-devel
+  fontconfig-devel freetype-devel`.
+- `scripts/ci-sources restore`, then `scripts/package
+  x86_64-unknown-linux-gnu` for the app (already working in run 3).
+- **Build herdr-core in the same job** (still to implement):
+  - Clone upstream `master` into a temp dir:
+    `git clone --depth 1 --branch master https://github.com/herdrdev/herdr-core.git <tmp>/herdr-core`.
+  - No patch application: master already carries the RHEL 8 fix. The patch
+    file stays in the repo for a pinned-core build.
+  - `git -C <tmp>/herdr-core submodule update --init --depth 1`.
+  - `cargo build --locked --release -p herdr-core` from that checkout (uses the
+    Rust/Zig toolchains already installed; herdr-core's CI also pins
+    Rust 1.95.0 and Zig 0.16).
+  - Unpack `dist/herdr-app-linux-x86_64.tar.gz`, copy
+    `<tmp>/herdr-core/target/release/herdr-core` into `herdr-app/`, add an `hc`
+    symlink to it, and repack as `dist/herdr-app-rhel8-x86_64.tar.gz`. Leave
+    `scripts/package` itself unchanged.
+- Delete the old `ci-passed`, `sign-windows`, `mac-dmg`, and `publish` jobs;
+  they only exist for the platforms/artifacts being removed.
+- Verification steps:
+  - `ldd --version | head -1` reports glibc 2.28 (proves the container, not the
+    Ubuntu host, built it).
+  - Highest `GLIBC_*` symbol used by the app and core binaries is <= 2.28.
+  - Final tarball lists `herdr-app/{herdr-app,herdr-core,hc,herdr-app.svg,LICENSE,THIRD-PARTY-NOTICES}`;
+    notices still `cmp` against the repo copies.
+  - Smoke tests with scratch dirs: app `HERDR_APP_HOME=<scratch> herdr-app --help`
+    and core `herdr-core --version` (both only talk; no window or real user data).
+- Upload the final tarball with pinned `actions/upload-artifact`,
+  `if-no-files-found: error`, 7-day retention. No cache yet; add one only after
+  the full app+core run is green.
+
+### 3. Commit, push, trigger, iterate
+
+```sh
+git add .github/workflows/release.yml
+git commit -m "ci: build RHEL 8 release on x86_64 only"
+git push -u origin build/rhel8-release-gha
+REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+gh workflow run release.yml --repo "$REPO" --ref build/rhel8-release-gha
+gh run list --workflow release.yml --repo "$REPO" --limit 5
+gh run watch <run-id> --repo "$REPO" --exit-status
+```
+
+On failure: `gh run view <run-id> --repo "$REPO" --log-failed`, fix
+the workflow on the same branch, commit with a lowercase conventional message,
+push, re-trigger, and repeat **until the run succeeds**. Keep the scope
+single-platform while debugging — don't restore Windows/macOS/CI/publishing to
+work around a failure.
+
+### 4. Handoff
+
+Report the final green run URL, artifact name, glibc check output, and branch.
+Publishing and a real RHEL 8 desktop smoke test remain separate decisions.
+
+### 5. CPU rendering tuning (issue #1)
+
+The app is unchanged; the tuning lives in the vendored renderer and is
+selected from the environment, so a GPU machine keeps its old behavior.
+
+| Change | Default | Override |
+|---|---|---|
+| Present mode | `Immediate` on a software adapter (`DeviceType::Cpu`); otherwise the surface's preference, else `Fifo` | `HERDR_APP_PRESENT_MODE=fifo\|mailbox\|immediate` |
+| Frame latency | `1` with `Immediate`, else `2`; wGPU ignores it on OpenGL | `HERDR_APP_FRAME_LATENCY=1..4` |
+| Path MSAA | `1` on a software adapter (the path pass writes a full-window intermediate texture); otherwise 4x/2x/1x as before | `HERDR_APP_PATH_MSAA=1\|2\|4` |
+| Damage | swap rects on GL X11 CPU windows; scissored redraw where the surface supports `COPY_DST` | `HERDR_APP_DAMAGE_TRACKING=0` |
+| wGPU backends | Vulkan + GL | `GPUI_WGPU_BACKEND=vulkan\|gl` (comma-separated) |
+| Frame timings | off | `GPUI_WGPU_FRAME_LOG=1` logs frames/s, acquire/render/present ms, damage rects and area once a second |
+| Startup line | always at info | `HERDR_APP_LOG=info` shows adapter/backend/type, present mode, latency, path MSAA, subpixel text and damage mode |
+
+Headless renderers and screenshot tests do not get the CPU tuning
+(`tune_for_cpu = false`), so `shot_pixels` stays pixel-identical. `Immediate`
+can tear on X11; that is the accepted "faster, less pretty" trade for this
+build, and `HERDR_APP_PRESENT_MODE=fifo` restores vsync.
+
+## Run log
+
+| # | Commit | Run URL | Result | Fix |
+|---|---|---|---|---|
+| 1 | `ffeaf41` | https://github.com/shawn111/herdr-app/actions/runs/45259164686 | failed in `Bootstrap container tools`: `GPG check FAILED` (pinned AlmaLinux 8 image has only the old `C21AD6EA` key; current packages use newer keys) | Refresh `/etc/pki/rpm-gpg/RPM-GPG-KEY-AlmaLinux` from `https://repo.almalinux.org/almalinux/RPM-GPG-KEY-AlmaLinux` over HTTPS and `rpm --import` it before `dnf install` (no `nogpgcheck`). |
+| 2 | `3756df7` | https://github.com/shawn111/herdr-app/actions/runs/45259697562 | failed in `Keep unchanged sources fresh`: `fatal: detected dubious ownership in repository at '/__w/herdr-app/herdr-app'` (container root vs runner-owned workspace) | Add `git config --global --add safe.directory "$GITHUB_WORKSPACE"` after checkout. |
+| 3 | `cb80aaf` | https://github.com/shawn111/herdr-app/actions/runs/45260188232 | **success** (11m43s), app only: `ldd (GNU libc) 2.28`, `highest GLIBC symbol version required: 2.28`, tarball/notices/`--help` checks passed, artifact uploaded | None needed; next step is adding herdr-core. |
+| 4 | `e526642` | https://github.com/shawn111/herdr-app/actions/runs/45276478949 | failed in `Check glibc floor`: exit 141 (SIGPIPE) from `objdump | grep | sort -Vu | tail -1 | cut` after printing glibc 2.28 | Replace pipeline with awk that reads full objdump output and computes max GLIBC version. |
+| 5 | `83d0c6c` | https://github.com/shawn111/herdr-app/actions/runs/45280201963 | **success**: `ldd (GNU libc) 2.28`, `herdr-app` and `herdr-core` both at 2.28, artifact 38.5 MB | None needed; app+core green. |
+| 6 | `2d2a367` | https://github.com/shawn111/herdr-app/actions/runs/45320328933 | **success**: launcher `herdr-app-rhel8` and `README-rhel8.md` in the tarball; both binaries at glibc 2.28; artifact 38.5 MB | None needed. |
+| 7 | `9291769` | https://github.com/shawn111/herdr-app/actions/runs/45324805105 | failed in `Check glibc floor` with exit 141 right after `ldd --version \| head -1`; `head` closed the pipe and `pipefail` turned the producer's SIGPIPE into a failure (the same race the `objdump` step was fixed for) | Replace `head -1` with `sed -n '1p'` in that line and in the `sort -V` comparison; both read all input, so no SIGPIPE. |
+| 8 | `1236459` | https://github.com/shawn111/herdr-app/actions/runs/45326453930 | **success**: SIGPIPE fix; launcher defaults `LP_NUM_THREADS=1`; both binaries at glibc 2.28; artifact 38.5 MB | None needed. |
+| 9 | `aa094e8` | https://github.com/shawn111/herdr-app/actions/runs/45564766416 | **success**: CPU rendering tuning built; both binaries at glibc 2.28; artifact 38.6 MB | None needed. |
+
+## Risks / fallbacks
+
+- **Package names**: RHEL 8 differs from Ubuntu; `libxkbcommon-x11-devel` is
+  absent. If X11 headers are still missing, check what `libxkbcommon-devel` and
+  `libxkbcommon-x11` provide and adjust.
+- **Old image key**: refresh the official GPG keyring from HTTPS; do not
+  disable signature checks.
+- **JS actions inside the container**: if a pinned action fails on glibc 2.28,
+  use plain `run:` steps (`git clone --recurse-submodules`) and `rustup`/`curl`
+  for toolchains.
+- **herdr-core build**: it uses LTO + `strip` in release mode, so the build may
+  take several minutes; keep the 60-minute job timeout. Master already avoids
+  `--same-dir` on systemd 239; note the core commit in the handoff. If a build
+  ever needs a pinned core tag, re-derive the kept patch against that tag first.
+- **Runtime compatibility**: glibc 2.28 is the floor, not a guarantee; the app
+  still needs a desktop session and a working Vulkan driver (README.md). Test
+  the artifact on a real RHEL 8 machine before any future publication.
+
+## Possible follow-ups (not this task)
+
+1. RHEL 8 aarch64 build.
+2. Decide whether this tarball joins the release manifest/installer.
+3. Optional RPM package.

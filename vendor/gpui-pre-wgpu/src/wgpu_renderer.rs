@@ -4,17 +4,18 @@ use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    ScaledPixels, Scene, SceneDamage, Size, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawWindowHandle};
 use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::num::NonZeroU64;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
@@ -53,6 +54,253 @@ fn least_common_multiple(left: u64, right: u64) -> u64 {
         second = remainder;
     }
     left / first * right
+}
+
+/// Clears the scissored region of a partial frame. Its load op keeps the
+/// previous frame; the blend state writes the clear color from the blend
+/// constant while the fragment shader writes one.
+const CLEAR_SHADER: &str = "
+@vertex
+fn vs_clear(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4<f32> {
+    let corner = vec2<f32>(f32((vertex_index << 1u) & 2u), f32(vertex_index & 2u));
+    return vec4<f32>(corner * 2.0 - 1.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs_clear() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0);
+}
+";
+
+/// Holds the last complete frame so a partial frame can redraw only its
+/// damaged region on top of it. Swapchain images cannot be used for this
+/// because their contents are not preserved across presents.
+struct DamageTarget {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
+/// How a window uses the damage rect computed by the scene diff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DamageMode {
+    /// Redraw and present the whole window.
+    Disabled,
+    /// Redraw the whole window, but tell the compositor which part changed.
+    ///
+    /// GLES surfaces expose only `RENDER_ATTACHMENT`, so they cannot be the
+    /// destination of the persistent-target copy. They can still receive a
+    /// damage rect at present time.
+    PresentDamage,
+    /// Redraw only the damaged region into a persistent target, copy the whole
+    /// target into the swapchain, then present with the damage rect.
+    CopyToSwapchain,
+}
+
+impl DamageMode {
+    fn enabled(self) -> bool {
+        self != Self::Disabled
+    }
+}
+
+/// Choose the damage path. Keep this a pure function so the backend-specific
+/// rules can be tested without a surface.
+fn choose_damage_mode(
+    backend: wgpu::Backend,
+    x11_window: bool,
+    tracking_enabled: bool,
+    cpu_adapter: bool,
+    surface_supports_copy_dst: bool,
+) -> DamageMode {
+    if !x11_window || !tracking_enabled || !cpu_adapter {
+        return DamageMode::Disabled;
+    }
+    if backend == wgpu::Backend::Gl {
+        return DamageMode::PresentDamage;
+    }
+    if surface_supports_copy_dst {
+        DamageMode::CopyToSwapchain
+    } else {
+        DamageMode::Disabled
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrawOutcome {
+    Presented,
+    /// Nothing changed since the last present, so presenting was skipped.
+    Unchanged,
+    Failed,
+}
+
+/// The pixels covered by `damage`, clamped to a `width` x `height` target, or
+/// `None` when they cover the whole target. Padded by a pixel because
+/// antialiased edges can reach slightly past a primitive's bounds.
+fn damage_scissor(
+    damage: Bounds<ScaledPixels>,
+    width: u32,
+    height: u32,
+) -> Option<wgpu::Rect<u32>> {
+    let left = ((damage.origin.x.0.floor() - 1.0).max(0.0) as u32).min(width);
+    let top = ((damage.origin.y.0.floor() - 1.0).max(0.0) as u32).min(height);
+    let right = ((damage.origin.x.0 + damage.size.width.0).ceil() + 1.0).max(0.0) as u32;
+    let bottom = ((damage.origin.y.0 + damage.size.height.0).ceil() + 1.0).max(0.0) as u32;
+    let right = right.min(width);
+    let bottom = bottom.min(height);
+    let scissor = wgpu::Rect {
+        x: left,
+        y: top,
+        w: right.saturating_sub(left),
+        h: bottom.saturating_sub(top),
+    };
+    (scissor.w != width || scissor.h != height).then_some(scissor)
+}
+
+/// HERDR: pick a present mode, letting a CPU-only machine skip vblank waits.
+///
+/// `HERDR_APP_PRESENT_MODE=fifo|mailbox|immediate` forces one mode (falling
+/// back to `Fifo` when the surface cannot do it). Unset keeps the surface's
+/// preference, except that software adapters (llvmpipe/lavapipe) get
+/// `Immediate`: a frame that finishes late should not wait for the next
+/// vblank on a machine that is already too slow.
+fn choose_present_mode(
+    preferred: Option<wgpu::PresentMode>,
+    cpu_adapter: bool,
+    supported: &[wgpu::PresentMode],
+) -> wgpu::PresentMode {
+    let requested = match std::env::var("HERDR_APP_PRESENT_MODE") {
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => None,
+            "fifo" | "vsync" => Some(wgpu::PresentMode::Fifo),
+            "mailbox" => Some(wgpu::PresentMode::Mailbox),
+            "immediate" | "no-vsync" | "novsync" => Some(wgpu::PresentMode::Immediate),
+            other => {
+                log::warn!("HERDR_APP_PRESENT_MODE: unknown mode {other:?}; using auto");
+                None
+            }
+        },
+        Err(_) => None,
+    };
+
+    let wanted = requested
+        .or(preferred)
+        .or_else(|| cpu_adapter.then_some(wgpu::PresentMode::Immediate));
+    let Some(mode) = wanted else {
+        return wgpu::PresentMode::Fifo;
+    };
+    if supported.contains(&mode) {
+        mode
+    } else {
+        log::warn!("wgpu: present mode {mode:?} is not supported by this surface; using Fifo");
+        wgpu::PresentMode::Fifo
+    }
+}
+
+/// HERDR: `HERDR_APP_DAMAGE_TRACKING=0` restores the full-frame path when a
+/// driver or compositor handles partial presentation badly.
+fn damage_tracking_enabled() -> bool {
+    match std::env::var("HERDR_APP_DAMAGE_TRACKING").as_deref() {
+        Ok("0" | "false" | "off") => false,
+        Ok("" | "1" | "true" | "on") => true,
+        Ok(other) => {
+            warn!("HERDR_APP_DAMAGE_TRACKING: expected 0 or 1, got {other:?}; using 1");
+            true
+        }
+        Err(_) => true,
+    }
+}
+
+/// HERDR: how many frames the driver may queue. `Immediate` has nothing to
+/// wait for, so keep one; otherwise the previous default of two.
+fn frame_latency(present_mode: wgpu::PresentMode) -> u32 {
+    if let Ok(raw) = std::env::var("HERDR_APP_FRAME_LATENCY") {
+        match raw.trim().parse::<u32>() {
+            Ok(latency) => return latency.clamp(1, 4),
+            Err(_) => log::warn!("HERDR_APP_FRAME_LATENCY: expected 1-4, got {raw:?}; using auto"),
+        }
+    }
+    if matches!(present_mode, wgpu::PresentMode::Immediate) {
+        1
+    } else {
+        2
+    }
+}
+
+/// HERDR: per-second frame timings for slow machines, where the app's
+/// `HERDR_APP_BENCH` stops before the renderer. `GPUI_WGPU_FRAME_LOG=1` logs
+/// acquire/render/present averages once a second; it is off by default so
+/// normal frames pay nothing. `present` includes the driver's swap (and any
+/// vblank wait), not necessarily the GPU finishing the frame.
+mod frame_log {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::time::{Duration, Instant};
+
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static FRAMES: AtomicU64 = AtomicU64::new(0);
+    static ACQUIRE_US: AtomicU64 = AtomicU64::new(0);
+    static RENDER_US: AtomicU64 = AtomicU64::new(0);
+    static PRESENT_US: AtomicU64 = AtomicU64::new(0);
+    static MAX_FRAME_US: AtomicU64 = AtomicU64::new(0);
+    static PARTIAL_FRAMES: AtomicU64 = AtomicU64::new(0);
+    static DAMAGE_BP: AtomicU64 = AtomicU64::new(0);
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+
+    pub fn enabled() -> bool {
+        *ENABLED.get_or_init(|| {
+            std::env::var_os("GPUI_WGPU_FRAME_LOG").is_some_and(|value| value != "0")
+        })
+    }
+
+    pub struct Frame {
+        pub acquire: Duration,
+        pub render: Duration,
+        pub present: Duration,
+        pub partial: bool,
+        /// Damaged area in basis points of the window; 10000 means full frame.
+        pub damage_bp: u64,
+    }
+
+    pub fn record(frame: Frame) {
+        FRAMES.fetch_add(1, Relaxed);
+        ACQUIRE_US.fetch_add(frame.acquire.as_micros() as u64, Relaxed);
+        RENDER_US.fetch_add(frame.render.as_micros() as u64, Relaxed);
+        PRESENT_US.fetch_add(frame.present.as_micros() as u64, Relaxed);
+        if frame.partial {
+            PARTIAL_FRAMES.fetch_add(1, Relaxed);
+            DAMAGE_BP.fetch_add(frame.damage_bp, Relaxed);
+        }
+        MAX_FRAME_US.fetch_max(
+            (frame.acquire + frame.render + frame.present).as_micros() as u64,
+            Relaxed,
+        );
+
+        let now = Instant::now();
+        let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if last.is_some_and(|last| now.duration_since(last) < Duration::from_secs(1)) {
+            return;
+        }
+        *last = Some(now);
+
+        let frames = FRAMES.swap(0, Relaxed);
+        if frames == 0 {
+            return;
+        }
+        let partial = PARTIAL_FRAMES.swap(0, Relaxed);
+        let damage_bp = DAMAGE_BP.swap(0, Relaxed);
+        let damage_pct = if partial == 0 {
+            100.0
+        } else {
+            damage_bp as f64 / partial as f64 / 100.0
+        };
+        let per_frame = |total: &AtomicU64| total.swap(0, Relaxed) as f64 / frames as f64 / 1000.0;
+        log::info!(
+            "wgpu frames/s={frames} acquire={:.2}ms render={:.2}ms present={:.2}ms max_frame={:.2}ms partial={partial}/{frames} damage={damage_pct:.1}%",
+            per_frame(&ACQUIRE_US),
+            per_frame(&RENDER_US),
+            per_frame(&PRESENT_US),
+            MAX_FRAME_US.swap(0, Relaxed) as f64 / 1000.0,
+        );
+    }
 }
 
 #[repr(C)]
@@ -116,7 +364,8 @@ pub struct WgpuSurfaceConfig {
     pub transparent: bool,
     /// Preferred presentation mode. When `Some`, the renderer will use this
     /// mode if supported by the surface, falling back to `Fifo`.
-    /// When `None`, defaults to `Fifo` (VSync).
+    /// When `None`, uses `Immediate` on a software adapter (HERDR: CPU-only
+    /// machines should not wait for vblank) and `Fifo` (VSync) otherwise.
     ///
     /// Mobile platforms may prefer `Mailbox` (triple-buffering) to avoid
     /// blocking in `get_current_texture()` during lifecycle transitions.
@@ -134,6 +383,7 @@ struct WgpuPipelines {
     poly_sprites: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
+    clear: wgpu::RenderPipeline,
 }
 
 /// One frame allocation of instance data, ready to bind.
@@ -224,6 +474,7 @@ struct WgpuRendererCore {
     dual_source_blending: bool,
     adapter_info: wgpu::AdapterInfo,
     target_format: wgpu::TextureFormat,
+    damage_target: Option<DamageTarget>,
     max_texture_size: u32,
 }
 
@@ -264,6 +515,15 @@ pub struct WgpuRenderer {
     needs_redraw: bool,
     // HERDR: atlas validity must outlive the consumable redraw request.
     scene_valid: bool,
+    /// Whether the surface belongs to an X11 window, so device recovery can
+    /// rebuild the same presentation path.
+    x11_window: bool,
+    /// How the scene-damage rect is used by this window.
+    damage_mode: DamageMode,
+    /// Damage accumulated since the last present.
+    pending_damage: SceneDamage,
+    /// Atlas generation used by the last presented frame.
+    last_atlas_generation: u64,
 }
 
 impl WgpuRenderer {
@@ -271,6 +531,7 @@ impl WgpuRenderer {
     fn invalidate_scene(&mut self) {
         self.scene_valid = false;
         self.needs_redraw = true;
+        self.pending_damage = SceneDamage::Full;
     }
 
     fn core(&self) -> Option<&WgpuRendererCore> {
@@ -309,6 +570,12 @@ impl WgpuRenderer {
         let window_handle = window
             .window_handle()
             .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
+        // Partial presentation is only for X11 today. Wayland's compositor has
+        // its own damage protocol, so leave that window on the full-frame path.
+        let x11_window = matches!(
+            window_handle.as_raw(),
+            RawWindowHandle::Xcb(_) | RawWindowHandle::Xlib(_)
+        );
 
         let target = wgpu::SurfaceTargetUnsafe::RawHandle {
             // Fall back to the display handle already provided via InstanceDescriptor::display.
@@ -352,6 +619,7 @@ impl WgpuRenderer {
             config,
             compositor_gpu,
             atlas,
+            x11_window,
         )
     }
 
@@ -376,7 +644,7 @@ impl WgpuRenderer {
         config: WgpuSurfaceConfig,
     ) -> anyhow::Result<Self> {
         let atlas = Arc::new(WgpuAtlas::from_context(context));
-        Self::new_internal(None, context, surface, config, None, atlas)
+        Self::new_internal(None, context, surface, config, None, atlas, false)
     }
 
     fn new_internal(
@@ -386,6 +654,7 @@ impl WgpuRenderer {
         config: WgpuSurfaceConfig,
         compositor_gpu: Option<CompositorGpuHint>,
         atlas: Arc<WgpuAtlas>,
+        x11_window: bool,
     ) -> anyhow::Result<Self> {
         let surface_caps = surface.get_capabilities(&context.adapter);
         let preferred_formats = [
@@ -396,7 +665,13 @@ impl WgpuRenderer {
             .iter()
             .find(|f| surface_caps.formats.contains(f))
             .copied()
-            .or_else(|| surface_caps.formats.iter().find(|f| !f.is_srgb()).copied())
+            .or_else(|| {
+                surface_caps
+                    .formats
+                    .iter()
+                    .find(|f| !f.has_srgb_suffix())
+                    .copied()
+            })
             .or_else(|| surface_caps.formats.first().copied())
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -452,16 +727,43 @@ impl WgpuRenderer {
             );
         }
 
+        let adapter_info = context.adapter.get_info();
+        let cpu_adapter = adapter_info.device_type == wgpu::DeviceType::Cpu;
+        let present_mode = choose_present_mode(
+            config.preferred_present_mode,
+            cpu_adapter,
+            &surface_caps.present_modes,
+        );
+        let frame_latency = frame_latency(present_mode);
+
+        // HERDR: damage is only for X11 CPU adapters, and the kill switch still
+        // restores the old full-frame path. GLES cannot copy a persistent target
+        // into its surface, but it can pass the damage rect to the compositor;
+        // other backends keep the existing copy-to-swapchain path.
+        let copy_damage_supported = surface_caps.usages.contains(wgpu::TextureUsages::COPY_DST);
+        let damage_mode = if cfg!(not(target_family = "wasm")) {
+            choose_damage_mode(
+                adapter_info.backend,
+                x11_window,
+                damage_tracking_enabled(),
+                cpu_adapter,
+                copy_damage_supported,
+            )
+        } else {
+            DamageMode::Disabled
+        };
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: if damage_mode == DamageMode::CopyToSwapchain {
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST
+            } else {
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+            },
             format: surface_format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: clamped_width.max(1),
             height: clamped_height.max(1),
-            present_mode: config
-                .preferred_present_mode
-                .filter(|mode| surface_caps.present_modes.contains(mode))
-                .unwrap_or(wgpu::PresentMode::Fifo),
-            desired_maximum_frame_latency: 2,
+            present_mode,
+            desired_maximum_frame_latency: frame_latency,
             alpha_mode,
             view_formats: vec![],
         };
@@ -469,14 +771,28 @@ impl WgpuRenderer {
         // that this adapter can successfully configure this surface.
         surface.configure(&context.device, &surface_config);
 
-        let core = WgpuRendererCore::new(context, atlas.clone(), surface_format, alpha_mode);
+        let core = WgpuRendererCore::new(context, atlas.clone(), surface_format, alpha_mode, true);
+        // HERDR: one line that answers "what is this machine rendering with?"
+        log::info!(
+            "wgpu window: adapter={:?} backend={:?} type={:?}; present={:?} latency={}; \
+             path MSAA={}; subpixel text={}; damage={}; damage mode={:?}",
+            adapter_info.name,
+            adapter_info.backend,
+            adapter_info.device_type,
+            present_mode,
+            frame_latency,
+            core.rendering_params.path_sample_count,
+            core.dual_source_blending,
+            damage_mode.enabled(),
+            damage_mode,
+        );
 
         Ok(Self {
             context: gpu_context,
             compositor_gpu,
             state: RendererState::Ready { surface, core },
             surface_config,
-            atlas,
+            atlas: Arc::clone(&atlas),
             transparent_alpha_mode,
             opaque_alpha_mode,
             max_texture_size,
@@ -487,6 +803,10 @@ impl WgpuRenderer {
             last_surface_error: None,
             needs_redraw: false,
             scene_valid: true,
+            x11_window,
+            damage_mode,
+            pending_damage: SceneDamage::Full,
+            last_atlas_generation: atlas.as_ref().generation(),
         })
     }
 }
@@ -649,6 +969,7 @@ impl WgpuRendererCore {
             format: wgpu::TextureFormat::Rgba32Uint,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
+            texture_binding_view_dimension: None,
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let capacity = u64::from(width) * u64::from(height) * INSTANCE_TEXTURE_TEXEL_SIZE;
@@ -939,6 +1260,52 @@ impl WgpuRendererCore {
             &shader_module,
         );
 
+        let clear_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("clear_shader"),
+            source: wgpu::ShaderSource::Wgsl(CLEAR_SHADER.into()),
+        });
+        let clear_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("clear_layout"),
+            bind_group_layouts: &[],
+            immediate_size: 0,
+        });
+        let clear = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("clear"),
+            layout: Some(&clear_layout),
+            vertex: wgpu::VertexState {
+                module: &clear_module,
+                entry_point: Some("vs_clear"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &clear_module,
+                entry_point: Some("fs_clear"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::Constant,
+                            dst_factor: wgpu::BlendFactor::Zero,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::Constant,
+                            dst_factor: wgpu::BlendFactor::Zero,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         WgpuPipelines {
             quads,
             shadows,
@@ -949,6 +1316,7 @@ impl WgpuRendererCore {
             subpixel_sprites,
             poly_sprites,
             surfaces,
+            clear,
         }
     }
 
@@ -971,6 +1339,7 @@ impl WgpuRendererCore {
             format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
+            texture_binding_view_dimension: None,
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         (texture, view)
@@ -999,6 +1368,7 @@ impl WgpuRendererCore {
             format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
+            texture_binding_view_dimension: None,
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         Some((texture, view))
@@ -1027,6 +1397,7 @@ impl WgpuRenderer {
         }
         self.surface_config.width = clamped_width.max(1);
         self.surface_config.height = clamped_height.max(1);
+        self.pending_damage = SceneDamage::Full;
 
         let Some(core) = self.core_mut() else {
             return;
@@ -1060,7 +1431,11 @@ impl WgpuRenderer {
     }
 
     pub fn set_subpixel_layout(&mut self, is_bgr: bool) {
+        if is_bgr == self.is_bgr {
+            return;
+        }
         self.is_bgr = is_bgr;
+        self.pending_damage = SceneDamage::Full;
         if let Some(core) = self.core_mut() {
             core.is_bgr = is_bgr;
         }
@@ -1076,6 +1451,7 @@ impl WgpuRenderer {
             return;
         }
         self.surface_config.alpha_mode = new_alpha_mode;
+        self.pending_damage = SceneDamage::Full;
         let format = self.surface_config.format;
 
         let Some(core) = self.core_mut() else {
@@ -1160,6 +1536,7 @@ impl WgpuRenderer {
                 format: core.target_format,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
+            texture_binding_view_dimension: None,
             });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         core.render_frame(
@@ -1171,6 +1548,7 @@ impl WgpuRenderer {
             },
             self.surface_config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied,
             wgpu::Color::TRANSPARENT,
+            None,
         )?;
         let image = core.read_texture(&texture)?;
         anyhow::ensure!(!self.device_lost(), "GPU device was lost during screenshot");
@@ -1180,7 +1558,29 @@ impl WgpuRenderer {
         Ok(image)
     }
 
+    /// Whether this renderer uses the damage passed to [`Self::draw_with_damage`].
+    pub fn damage_enabled(&self) -> bool {
+        self.damage_mode.enabled()
+    }
+
     pub fn draw(&mut self, scene: &Scene) -> bool {
+        self.draw_with_damage(scene, None) == DrawOutcome::Presented
+    }
+
+    /// `damage` is the region that changed since the last present. `None` means
+    /// it was not computed, so the whole frame is redrawn.
+    pub fn draw_with_damage(&mut self, scene: &Scene, damage: Option<SceneDamage>) -> DrawOutcome {
+        // Accumulate before any early return so a dropped frame's damage is not lost.
+        self.pending_damage = self
+            .pending_damage
+            .union(damage.unwrap_or(SceneDamage::Full));
+
+        let atlas_generation = self.atlas.generation();
+        if atlas_generation != self.last_atlas_generation {
+            self.pending_damage = SceneDamage::Full;
+            self.last_atlas_generation = atlas_generation;
+        }
+
         #[cfg(target_family = "wasm")]
         if self.device_lost() {
             if matches!(self.state, RendererState::Ready { .. }) {
@@ -1189,7 +1589,7 @@ impl WgpuRenderer {
                 );
                 self.unconfigure_surface();
             }
-            return false;
+            return DrawOutcome::Failed;
         }
 
         // Bail out early if the surface has been unconfigured (e.g. during
@@ -1197,7 +1597,7 @@ impl WgpuRenderer {
         // a texture from an unconfigured surface can block indefinitely on
         // some drivers (Adreno).
         let RendererState::Ready { surface, core } = &mut self.state else {
-            return false;
+            return DrawOutcome::Failed;
         };
 
         if let Some(error) = self.last_surface_error.take().or_else(|| {
@@ -1218,58 +1618,158 @@ impl WgpuRenderer {
                 self.atlas.clear();
                 self.invalidate_scene();
                 self.failed_frame_count = 0;
-                return false;
+                return DrawOutcome::Failed;
             }
         } else {
             self.failed_frame_count = 0;
         }
 
+        if self.pending_damage.is_unchanged() {
+            return DrawOutcome::Unchanged;
+        }
+
+        let timing = frame_log::enabled().then(Instant::now);
         let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
                 // Textures must be destroyed before the surface can be reconfigured.
                 drop(frame);
                 surface.configure(&core.resources.device, &self.surface_config);
-                return false;
+                self.pending_damage = SceneDamage::Full;
+                return DrawOutcome::Failed;
             }
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 surface.configure(&core.resources.device, &self.surface_config);
-                return false;
+                self.pending_damage = SceneDamage::Full;
+                return DrawOutcome::Failed;
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return false;
+                return DrawOutcome::Failed;
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 self.last_surface_error = Some("Surface texture validation error".to_string());
-                return false;
+                return DrawOutcome::Failed;
             }
         };
 
         // The acquired texture is the authority on frame dimensions; the surface
         // configuration is only a request.
+        let acquire = timing.map(|start| start.elapsed()).unwrap_or_default();
         let size = Size {
             width: DevicePixels(frame.texture.width() as i32),
             height: DevicePixels(frame.texture.height() as i32),
         };
-        let frame_view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let width = size.width.0 as u32;
+        let height = size.height.0 as u32;
+
+        let copy_damage = self.damage_mode == DamageMode::CopyToSwapchain;
+        if copy_damage && core.ensure_damage_target(size, frame.texture.format()) {
+            self.pending_damage = SceneDamage::Full;
+        }
+        // Every enabled mode computes a damage rect. `PresentDamage` only uses it
+        // at present time; `CopyToSwapchain` also uses it to scissor rendering.
+        let damage_rect = if self.damage_mode.enabled() {
+            match self.pending_damage {
+                SceneDamage::Rect(damage) => damage_scissor(damage, width, height),
+                SceneDamage::Full | SceneDamage::Unchanged => None,
+            }
+        } else {
+            None
+        };
+        let damage_bp = damage_rect.map_or(10_000, |damage_rect| {
+            let total = u64::from(width).saturating_mul(u64::from(height));
+            if total == 0 {
+                10_000
+            } else {
+                u64::from(damage_rect.w)
+                    .saturating_mul(u64::from(damage_rect.h))
+                    .saturating_mul(10_000)
+                    .div_euclid(total)
+                    .min(10_000)
+            }
+        });
+        if damage_rect.is_some_and(|rect| rect.w == 0 || rect.h == 0) {
+            // The damage lies outside the window.
+            self.pending_damage = SceneDamage::Unchanged;
+            return DrawOutcome::Unchanged;
+        }
+
+        let (target_texture, target_view) = if copy_damage {
+            let Some(target) = core.damage_target.as_ref() else {
+                return DrawOutcome::Failed;
+            };
+            (Some(target.texture.clone()), target.view.clone())
+        } else {
+            (
+                None,
+                frame
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor::default()),
+            )
+        };
+
         let premultiplied_alpha =
             self.surface_config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied;
+        let render_start = timing.map(|_| Instant::now());
         if let Err(error) = core.render_frame(
             scene,
-            &frame_view,
+            &target_view,
             size,
             premultiplied_alpha,
             wgpu::Color::TRANSPARENT,
+            if copy_damage { damage_rect } else { None },
         ) {
             log::error!("{error:#}");
-            return false;
+            return DrawOutcome::Failed;
         }
 
+        if let Some(target_texture) = target_texture {
+            // The swapchain image does not hold the previous frame, so copy all
+            // of it even when only a small region was redrawn.
+            let mut encoder =
+                core.resources
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("damage_copy_encoder"),
+                    });
+            encoder.copy_texture_to_texture(
+                target_texture.as_image_copy(),
+                frame.texture.as_image_copy(),
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            core.resources
+                .queue
+                .submit(std::iter::once(encoder.finish()));
+        }
+
+        let render = render_start
+            .map(|start| start.elapsed())
+            .unwrap_or_default();
+
         self.scene_valid = true;
-        frame.present();
-        true
+        let present_start = timing.map(|_| Instant::now());
+        if let Some(damage_rect) = damage_rect {
+            core.resources
+                .queue
+                .present_with_damage(frame, &[damage_rect]);
+        } else {
+            core.resources.queue.present(frame);
+        }
+        if let (Some(_), Some(present_start)) = (timing, present_start) {
+            frame_log::record(frame_log::Frame {
+                acquire,
+                render,
+                present: present_start.elapsed(),
+                partial: damage_rect.is_some(),
+                damage_bp,
+            });
+        }
+        self.pending_damage = SceneDamage::Unchanged;
+        DrawOutcome::Presented
     }
 }
 
@@ -1352,7 +1852,7 @@ impl WgpuRendererCore {
         self.resources
             .device
             .poll(wgpu::PollType::Wait {
-                submission_index: Some(submission),
+                submission_index: submission,
                 timeout: Some(std::time::Duration::from_secs(5)),
             })
             .map_err(|error| anyhow::anyhow!("Failed to wait for headless rendering: {error}"))?;
@@ -1363,7 +1863,10 @@ impl WgpuRendererCore {
             .map_err(|error| anyhow::anyhow!("Failed to receive headless mapping result: {error}"))?
             .map_err(|error| anyhow::anyhow!("Failed to map headless readback buffer: {error}"))?;
 
-        let mapped_data = readback_buffer.slice(..).get_mapped_range();
+        let mapped_data = readback_buffer
+            .slice(..)
+            .get_mapped_range()
+            .map_err(|error| anyhow::anyhow!("Failed to map headless readback buffer: {error}"))?;
         let pixel_capacity = usize::try_from(u64::from(bytes_per_row) * u64::from(height))
             .map_err(|_| anyhow::anyhow!("Headless image size exceeds addressable memory"))?;
         let mut pixels = Vec::with_capacity(pixel_capacity);
@@ -1396,10 +1899,12 @@ impl WgpuRendererCore {
         atlas: Arc<WgpuAtlas>,
         target_format: wgpu::TextureFormat,
         alpha_mode: wgpu::CompositeAlphaMode,
+        tune_for_cpu: bool,
     ) -> Self {
         let device = Arc::clone(&context.device);
         let queue = Arc::clone(&context.queue);
-        let rendering_params = RenderingParameters::new(&context.adapter, target_format);
+        let rendering_params =
+            RenderingParameters::new(&context.adapter, target_format, tune_for_cpu);
         let uses_webgl_instance_data = context.uses_webgl_instance_data();
         let dual_source_blending =
             context.supports_dual_source_blending() && !uses_webgl_instance_data;
@@ -1544,6 +2049,7 @@ impl WgpuRendererCore {
             dual_source_blending,
             adapter_info: context.adapter.get_info(),
             target_format,
+            damage_target: None,
             max_texture_size,
         }
     }
@@ -1592,6 +2098,40 @@ impl WgpuRendererCore {
         resources.path_msaa_view = path_msaa_view;
     }
 
+    fn ensure_damage_target(
+        &mut self,
+        size: Size<DevicePixels>,
+        format: wgpu::TextureFormat,
+    ) -> bool {
+        let width = size.width.0.max(1) as u32;
+        let height = size.height.0.max(1) as u32;
+        let recreate = self
+            .damage_target
+            .as_ref()
+            .is_none_or(|target| target.texture.width() != width || target.texture.height() != height);
+        if !recreate {
+            return false;
+        }
+        let texture = self.resources.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("damage_target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+            texture_binding_view_dimension: None,
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.damage_target = Some(DamageTarget { texture, view });
+        true
+    }
+
     fn render_frame(
         &mut self,
         scene: &Scene,
@@ -1599,7 +2139,8 @@ impl WgpuRendererCore {
         size: Size<DevicePixels>,
         premultiplied_alpha: bool,
         clear_color: wgpu::Color,
-    ) -> Result<wgpu::SubmissionIndex> {
+        scissor: Option<wgpu::Rect<u32>>,
+    ) -> Result<Option<wgpu::SubmissionIndex>> {
         anyhow::ensure!(
             size.width.0 > 0 && size.height.0 > 0,
             "invalid render target size: {size:?}"
@@ -1646,7 +2187,7 @@ impl WgpuRendererCore {
             bytemuck::bytes_of(&gamma_params),
         );
 
-        self.record_frame(scene, target_view, clear_color)
+        self.record_frame(scene, target_view, clear_color, scissor)
             .inspect_err(|_| {
                 // Queue writes are staged before encoding; flush them even if the frame fails.
                 self.resources.queue.submit(std::iter::empty());
@@ -1658,7 +2199,8 @@ impl WgpuRendererCore {
         scene: &Scene,
         frame_view: &wgpu::TextureView,
         clear_color: wgpu::Color,
-    ) -> Result<wgpu::SubmissionIndex> {
+        scissor: Option<wgpu::Rect<u32>>,
+    ) -> Result<Option<wgpu::SubmissionIndex>> {
         let mut instance_offset = 0;
         let instance_bindings = self
             .write_instances(scene, &mut instance_offset)
@@ -1690,7 +2232,11 @@ impl WgpuRendererCore {
                     view: frame_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color),
+                        load: if scissor.is_some() {
+                            wgpu::LoadOp::Load
+                        } else {
+                            wgpu::LoadOp::Clear(clear_color)
+                        },
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -1698,6 +2244,17 @@ impl WgpuRendererCore {
                 depth_stencil_attachment: None,
                 ..Default::default()
             });
+            if let Some(scissor) = scissor {
+                pass.set_scissor_rect(scissor.x, scissor.y, scissor.w, scissor.h);
+                pass.set_blend_constant(wgpu::Color {
+                    r: clear_color.r as f64,
+                    g: clear_color.g as f64,
+                    b: clear_color.b as f64,
+                    a: clear_color.a as f64,
+                });
+                pass.set_pipeline(&self.resources().pipelines.clear);
+                pass.draw(0..3, 0..1);
+            }
 
             for batch in scene.batches() {
                 match batch {
@@ -1740,6 +2297,9 @@ impl WgpuRendererCore {
                             depth_stencil_attachment: None,
                             ..Default::default()
                         });
+                        if let Some(scissor) = scissor {
+                            pass.set_scissor_rect(scissor.x, scissor.y, scissor.w, scissor.h);
+                        }
 
                         if rasterized {
                             self.draw_paths_from_intermediate(
@@ -2356,6 +2916,9 @@ impl WgpuRenderer {
         };
         surface.configure(&core.resources.device, &self.surface_config);
         core.resources.invalidate_intermediate_textures();
+        // A new surface has no preserved pixels, so damage tracking must start
+        // from a full frame even if the previous surface was unchanged.
+        self.pending_damage = SceneDamage::Full;
         self.state = RendererState::Ready { surface, core };
 
         Ok(())
@@ -2450,6 +3013,7 @@ impl WgpuRenderer {
             config,
             self.compositor_gpu,
             self.atlas.clone(),
+            self.x11_window,
         )?;
         self.set_subpixel_layout(is_bgr);
         self.invalidate_scene();
@@ -2508,6 +3072,7 @@ impl WgpuHeadlessRenderer {
             atlas,
             target_format,
             wgpu::CompositeAlphaMode::Opaque,
+            false,
         );
 
         Ok(Self {
@@ -2554,6 +3119,7 @@ impl WgpuHeadlessRenderer {
                 format: self.core.target_format,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
+            texture_binding_view_dimension: None,
             });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.render_target = Some(HeadlessRenderTarget { texture, view });
@@ -2585,7 +3151,7 @@ impl WgpuHeadlessRenderer {
             .view
             .clone();
         self.core
-            .render_frame(scene, &view, size, false, wgpu::Color::BLACK)?;
+            .render_frame(scene, &view, size, false, wgpu::Color::BLACK, None)?;
         Ok(())
     }
 
@@ -2651,14 +3217,46 @@ struct RenderingParameters {
 }
 
 impl RenderingParameters {
-    fn new(adapter: &wgpu::Adapter, surface_format: wgpu::TextureFormat) -> Self {
+    fn new(
+        adapter: &wgpu::Adapter,
+        surface_format: wgpu::TextureFormat,
+        tune_for_cpu: bool,
+    ) -> Self {
         use std::env;
 
         let format_features = adapter.get_texture_format_features(surface_format);
-        let path_sample_count = [4, 2, 1]
-            .into_iter()
-            .find(|&n| format_features.flags.sample_count_supported(n))
+        let cpu_adapter = tune_for_cpu && adapter.get_info().device_type == wgpu::DeviceType::Cpu;
+
+        // HERDR: paths rasterize into a full-window intermediate texture, and
+        // a software adapter pays for 4x MSAA on every pixel of it. One sample
+        // there keeps the (already software-drawn) paths from costing more
+        // than the rest of the frame; a real GPU keeps the usual 4x. Set
+        // HERDR_APP_PATH_MSAA=1|2|4 to choose another count.
+        let requested_msaa = match env::var("HERDR_APP_PATH_MSAA") {
+            Ok(raw) => match raw.trim().parse::<u32>() {
+                Ok(n @ (1 | 2 | 4)) => Some(n),
+                _ => {
+                    log::warn!("HERDR_APP_PATH_MSAA: expected 1, 2 or 4, got {raw:?}; using auto");
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+        let path_sample_count = requested_msaa
+            .or_else(|| cpu_adapter.then_some(1))
+            .filter(|&n| format_features.flags.sample_count_supported(n))
+            .or_else(|| {
+                [4, 2, 1]
+                    .into_iter()
+                    .find(|&n| format_features.flags.sample_count_supported(n))
+            })
             .unwrap_or(1);
+        if tune_for_cpu {
+            log::info!(
+                "wgpu path MSAA: {path_sample_count} sample(s){}",
+                if cpu_adapter { " (CPU adapter)" } else { "" }
+            );
+        }
 
         let gamma = env::var("ZED_FONTS_GAMMA")
             .ok()
@@ -3002,6 +3600,42 @@ mod tests {
                 32.0_f32.to_bits(),
                 33.0_f32.to_bits(),
             ]
+        );
+    }
+
+    #[test]
+    fn gl_cpu_x11_uses_present_damage_without_copy_dst() {
+        assert_eq!(
+            choose_damage_mode(wgpu::Backend::Gl, true, true, true, false),
+            DamageMode::PresentDamage
+        );
+    }
+
+    #[test]
+    fn non_gl_cpu_x11_still_needs_copy_dst_for_damage() {
+        assert_eq!(
+            choose_damage_mode(wgpu::Backend::Vulkan, true, true, true, true),
+            DamageMode::CopyToSwapchain
+        );
+        assert_eq!(
+            choose_damage_mode(wgpu::Backend::Vulkan, true, true, true, false),
+            DamageMode::Disabled
+        );
+    }
+
+    #[test]
+    fn damage_stays_disabled_outside_the_experiment() {
+        assert_eq!(
+            choose_damage_mode(wgpu::Backend::Gl, false, true, true, true),
+            DamageMode::Disabled
+        );
+        assert_eq!(
+            choose_damage_mode(wgpu::Backend::Gl, true, false, true, true),
+            DamageMode::Disabled
+        );
+        assert_eq!(
+            choose_damage_mode(wgpu::Backend::Gl, true, true, false, true),
+            DamageMode::Disabled
         );
     }
 }

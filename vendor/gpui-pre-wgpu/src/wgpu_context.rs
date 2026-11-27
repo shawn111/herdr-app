@@ -126,6 +126,42 @@ pub struct CompositorGpuHint {
     pub device_id: u32,
 }
 
+/// HERDR: let a CPU-only machine try one wgpu backend without rebuilding.
+///
+/// `GPUI_WGPU_BACKEND` is a comma-separated list of `vulkan`, `gl`, `metal`
+/// and `dx12`. Unset keeps the previous `VULKAN | GL` default. A name this
+/// build does not know is ignored; a list that names nothing falls back to the
+/// default rather than starting with no backends.
+#[cfg(not(target_family = "wasm"))]
+fn backends_from_env() -> wgpu::Backends {
+    let default = wgpu::Backends::VULKAN | wgpu::Backends::GL;
+    let Ok(raw) = std::env::var("GPUI_WGPU_BACKEND") else {
+        return default;
+    };
+
+    let mut backends = wgpu::Backends::empty();
+    for name in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        match name.to_ascii_lowercase().as_str() {
+            "vulkan" | "vk" => backends |= wgpu::Backends::VULKAN,
+            "gl" | "opengl" => backends |= wgpu::Backends::GL,
+            "metal" => backends |= wgpu::Backends::METAL,
+            "dx12" => backends |= wgpu::Backends::DX12,
+            other => log::warn!("GPUI_WGPU_BACKEND: ignoring unknown backend {other:?}"),
+        }
+    }
+
+    if backends.is_empty() {
+        log::warn!("GPUI_WGPU_BACKEND={raw:?} names no known backend; using Vulkan + GL");
+        return default;
+    }
+    log::info!("wgpu backends: {backends:?} (GPUI_WGPU_BACKEND={raw:?})");
+    backends
+}
+
 impl WgpuContext {
     #[cfg(not(target_family = "wasm"))]
     pub fn new(
@@ -453,6 +489,9 @@ impl WgpuContext {
                 label: Some("gpui_device"),
                 required_features,
                 required_limits,
+                default_queue: wgpu::QueueDescriptor {
+                    label: Some("gpui_queue"),
+                },
                 memory_hints: wgpu::MemoryHints::MemoryUsage,
                 trace: wgpu::Trace::Off,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
@@ -471,7 +510,7 @@ impl WgpuContext {
     #[cfg(not(target_family = "wasm"))]
     pub fn instance(display: Option<Box<dyn wgpu::wgt::WgpuHasDisplayHandle>>) -> wgpu::Instance {
         wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
+            backends: backends_from_env(),
             flags: wgpu::InstanceFlags::default(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
@@ -658,6 +697,7 @@ impl WgpuContext {
         let test_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: caps.formats[0],
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: 64,
             height: 64,
             present_mode: wgpu::PresentMode::Fifo,
