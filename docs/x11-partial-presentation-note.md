@@ -44,7 +44,11 @@ change the shipped no-GPU tuning until a benchmark shows a real improvement.
 - Initial CI: failed on Linux wGPU 30 API changes and stale third-party notices.
 - Local `cargo check -p gpui-pre-wgpu`: passing after the API fixes.
 - Third-party notices: regenerated with `cargo-about` 0.9.3 and Bun.
-- No performance improvement has been proven yet.
+- CI: Linux, macOS, and Windows all pass; RHEL 8 release build succeeds.
+- A first release build still feels slow; no performance improvement has been
+  proven. `GPUI_WGPU_FRAME_LOG=1` now also logs `partial=n/frames` and the
+  average damaged area, so an A/B run can show whether the partial path is
+  active and how much of the window it redraws.
 
 ## Next checks
 

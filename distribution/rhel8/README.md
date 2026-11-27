@@ -48,7 +48,7 @@ you can A/B one at a time:
 | `HERDR_APP_PATH_MSAA=1\|2\|4` | path antialiasing; default is 1 on a CPU adapter |
 | `HERDR_APP_DAMAGE_TRACKING=0` | disable partial presentation and redraw the whole window |
 | `GPUI_WGPU_BACKEND=vulkan\|gl` | use only one wGPU backend; comma-separate to allow both |
-| `GPUI_WGPU_FRAME_LOG=1` | log frames/s and acquire/render/present milliseconds once a second |
+| `GPUI_WGPU_FRAME_LOG=1` | log frames/s, acquire/render/present ms, and partial-frame damage area once a second |
 | `HERDR_APP_LOG=info` | show the adapter, backend, present mode, MSAA and X11 refresh rate at startup |
 
 Example, forcing OpenGL (llvmpipe) and logging frame times:

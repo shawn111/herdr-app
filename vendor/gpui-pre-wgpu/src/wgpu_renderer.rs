@@ -197,6 +197,8 @@ mod frame_log {
     static RENDER_US: AtomicU64 = AtomicU64::new(0);
     static PRESENT_US: AtomicU64 = AtomicU64::new(0);
     static MAX_FRAME_US: AtomicU64 = AtomicU64::new(0);
+    static PARTIAL_FRAMES: AtomicU64 = AtomicU64::new(0);
+    static DAMAGE_BP: AtomicU64 = AtomicU64::new(0);
     static LAST: Mutex<Option<Instant>> = Mutex::new(None);
 
     pub fn enabled() -> bool {
@@ -209,6 +211,9 @@ mod frame_log {
         pub acquire: Duration,
         pub render: Duration,
         pub present: Duration,
+        pub partial: bool,
+        /// Damaged area in basis points of the window; 10000 means full frame.
+        pub damage_bp: u64,
     }
 
     pub fn record(frame: Frame) {
@@ -216,6 +221,10 @@ mod frame_log {
         ACQUIRE_US.fetch_add(frame.acquire.as_micros() as u64, Relaxed);
         RENDER_US.fetch_add(frame.render.as_micros() as u64, Relaxed);
         PRESENT_US.fetch_add(frame.present.as_micros() as u64, Relaxed);
+        if frame.partial {
+            PARTIAL_FRAMES.fetch_add(1, Relaxed);
+            DAMAGE_BP.fetch_add(frame.damage_bp, Relaxed);
+        }
         MAX_FRAME_US.fetch_max(
             (frame.acquire + frame.render + frame.present).as_micros() as u64,
             Relaxed,
@@ -232,9 +241,16 @@ mod frame_log {
         if frames == 0 {
             return;
         }
+        let partial = PARTIAL_FRAMES.swap(0, Relaxed);
+        let damage_bp = DAMAGE_BP.swap(0, Relaxed);
+        let damage_pct = if partial == 0 {
+            100.0
+        } else {
+            damage_bp as f64 / partial as f64 / 100.0
+        };
         let per_frame = |total: &AtomicU64| total.swap(0, Relaxed) as f64 / frames as f64 / 1000.0;
         log::info!(
-            "wgpu frames/s={frames} acquire={:.2}ms render={:.2}ms present={:.2}ms max_frame={:.2}ms",
+            "wgpu frames/s={frames} acquire={:.2}ms render={:.2}ms present={:.2}ms max_frame={:.2}ms partial={partial}/{frames} damage={damage_pct:.1}%",
             per_frame(&ACQUIRE_US),
             per_frame(&RENDER_US),
             per_frame(&PRESENT_US),
@@ -1608,6 +1624,19 @@ impl WgpuRenderer {
         } else {
             None
         };
+        let partial_frame = scissor.is_some();
+        let damage_bp = scissor.map_or(10_000, |scissor| {
+            let total = u64::from(width).saturating_mul(u64::from(height));
+            if total == 0 {
+                10_000
+            } else {
+                u64::from(scissor.w)
+                    .saturating_mul(u64::from(scissor.h))
+                    .saturating_mul(10_000)
+                    .div_euclid(total)
+                    .min(10_000)
+            }
+        });
         if scissor.is_some_and(|scissor| scissor.w == 0 || scissor.h == 0) {
             // The damage lies outside the window.
             self.pending_damage = SceneDamage::Unchanged;
@@ -1684,6 +1713,8 @@ impl WgpuRenderer {
                 acquire,
                 render,
                 present: present_start.elapsed(),
+                partial: partial_frame,
+                damage_bp,
             });
         }
         self.pending_damage = SceneDamage::Unchanged;
